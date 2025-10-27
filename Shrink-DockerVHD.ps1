@@ -1,13 +1,14 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-  [string]   $Path,                # exact VHDX path (e.g. C:\Users\how\AppData\Local\Docker\wsl\disk\docker_data.vhdx)
-  [string[]] $Roots,               # search roots if -Path not provided
+  [string]   $Path,                # exact VHDX path (e.g. C:\Users\how\AppData\Local\Docker\wsl\disk\docker_data.vhdx or ...\LocalState\ext4.vhdx)
+  [string[]] $Roots,               # additional search roots if -Path not provided
   [switch]   $IncludeExt4 = $true, # include ext4.vhdx from WSL distros
   [switch]   $ForcePrune,          # run docker prune without asking
   [switch]   $SkipPrune,           # skip docker prune
   [string]   $LogPath,             # custom transcript path; default %TEMP%\Shrink-DockerVHD_yyyyMMdd_HHmmss.log
   [switch]   $OpenLog,             # open log in Notepad at the end or on error
-  [switch]   $AutoClose            # do not pause at the end
+  [switch]   $AutoClose,           # do not pause at the end
+  [switch]   $ScanWSL = $true      # scan %LOCALAPPDATA%\Packages\*\LocalState for ext4.vhdx
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,12 +33,10 @@ Write-Host "[*] Log file: $LogPath`n"
 
 # --- Info banner (ASCII only) ---
 Write-Host "============================================================================"
-Write-Host " Docker Cleanup Tip"
+Write-Host " Docker / WSL VHDX Shrinker"
 Write-Host "----------------------------------------------------------------------------"
-Write-Host " You can free a lot of space by removing unused Docker objects:"
-Write-Host "     docker system prune -a --volumes"
-Write-Host " This removes unused images/volumes, stopped containers, networks, build cache."
-Write-Host " CAUTION: Images may need to be re-pulled; back up important volumes first."
+Write-Host " Tip: you can free additional space by removing unused Docker objects:"
+Write-Host "   docker system prune -a --volumes"
 Write-Host "============================================================================`n"
 
 # --- Utilities ---
@@ -93,6 +92,7 @@ function WSL-Shutdown {
 
 function Get-DefaultRoots {
   $roots = @()
+  # Docker default locations
   if ($env:LOCALAPPDATA) { $roots += (Join-Path $env:LOCALAPPDATA 'Docker\wsl') }
   $roots += @(
     "$env:LOCALAPPDATA\Docker\wsl\data",
@@ -103,19 +103,48 @@ function Get-DefaultRoots {
   return $roots
 }
 
+function Get-WSLRoots {
+  # Return %LOCALAPPDATA%\Packages if present (we will filter to ext4.vhdx later)
+  $pkg = Join-Path $env:LOCALAPPDATA 'Packages'
+  if (Test-Path $pkg) { return ,$pkg }
+  return @()
+}
+
 function Find-VHDX {
-  param([string[]] $SearchRoots, [switch] $IncludeExt4)
+  param(
+    [string[]] $SearchRoots,
+    [switch]   $IncludeExt4,
+    [switch]   $ScanWSL
+  )
   $patterns = @('docker_data.vhdx','*.vhdx')
   $found = @()
+
   foreach ($root in $SearchRoots) {
     if (-not (Test-Path $root)) { continue }
     foreach ($pat in $patterns) {
       $found += Get-ChildItem -Path $root -Recurse -Filter $pat -ErrorAction SilentlyContinue
     }
   }
-  # Prefer Docker paths
+
+  # Optionally scan WSL packages for ext4.vhdx
+  if ($ScanWSL) {
+    $wslRoot = Get-WSLRoots
+    foreach ($wr in $wslRoot) {
+      if (Test-Path $wr) {
+        # Only look for ext4.vhdx to avoid scanning everything
+        $found += Get-ChildItem -Path $wr -Recurse -Filter 'ext4.vhdx' -ErrorAction SilentlyContinue
+      }
+    }
+  }
+
+  # Prefer Docker paths first
   $found = $found | Sort-Object { if ($_.FullName -match '\\Docker\\wsl\\') { 0 } else { 1 } }, Name -Unique
-  if (-not $IncludeExt4) { $found = $found | Where-Object { $_.Name -notlike 'ext4.vhdx' } }
+
+  # Optionally exclude ext4.vhdx
+  if (-not $IncludeExt4) {
+    $found = $found | Where-Object { $_.Name -notlike 'ext4.vhdx' }
+  }
+
   # Prefer docker_data.vhdx > ext4.vhdx > others
   $found = $found | Sort-Object {
     switch -Wildcard ($_.Name) { 'docker_data.vhdx' {0}; 'ext4.vhdx' {1}; default {2} }
@@ -179,7 +208,7 @@ function Shrink-OneVHDX {
 try {
   Assert-Admin
 
-  # 0) docker prune
+  # 0) docker prune (optional)
   $docker = Get-Command docker -ErrorAction SilentlyContinue
   if ($docker) {
     if ($SkipPrune) {
@@ -208,11 +237,17 @@ try {
     if (-not (Test-Path $Path)) { throw "Target not found: $Path" }
     $targets = ,(Get-Item -LiteralPath $Path)
   } else {
-    if (-not $Roots -or $Roots.Count -eq 0) { $Roots = Get-DefaultRoots }
-    Write-Host (">> Search roots: {0}" -f ($Roots -join '; '))
-    $targets = Find-VHDX -SearchRoots $Roots -IncludeExt4:$IncludeExt4
+    $searchRoots = @()
+    $searchRoots += Get-DefaultRoots
+    if ($Roots -and $Roots.Count -gt 0) { $searchRoots += $Roots }
+    $searchRoots = $searchRoots | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+
+    Write-Host (">> Search roots: {0}" -f ($searchRoots -join '; '))
+    $targets = Find-VHDX -SearchRoots $searchRoots -IncludeExt4:$IncludeExt4 -ScanWSL:$ScanWSL
     if (-not $targets -or $targets.Count -eq 0) {
-      throw "No VHDX found. Use -Path for a single file or -Roots to search (e.g. -Roots 'C:\Users\how\AppData\Local\Docker\wsl\disk')."
+      $hint = "Use -Path for a single file or -Roots to search. Example WSL path:`n" +
+              "C:\Users\how\AppData\Local\Packages\*\LocalState\ext4.vhdx"
+      throw "No VHDX found. $hint"
     }
   }
 
