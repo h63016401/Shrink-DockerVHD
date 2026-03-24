@@ -210,6 +210,7 @@ try {
 
   # 0) docker prune (optional)
   $docker = Get-Command docker -ErrorAction SilentlyContinue
+  $pruneSucceeded = $false
   if ($docker) {
     if ($SkipPrune) {
       Write-Host ">> Skip docker prune (requested)"
@@ -217,7 +218,44 @@ try {
       $doPrune = if ($ForcePrune) { $true } else { Prompt-YesNo -Message "Run 'docker system prune -a --volumes' now?" -DefaultYes:$true }
       if ($doPrune) {
         if ($PSCmdlet.ShouldProcess('docker', 'system prune -a --volumes --force')) {
-          try { docker system prune -a --volumes --force } catch { Write-Warning ("docker prune failed: {0}" -f $_.Exception.Message) }
+          # Ensure Docker Desktop is running before pruning
+          $dockerRunning = $false
+          try { docker info 2>$null | Out-Null; $dockerRunning = $true } catch { }
+
+          if (-not $dockerRunning) {
+            Write-Host ">> Docker daemon not running. Starting Docker Desktop..."
+            $ddPath = Get-ItemPropertyValue 'HKLM:\SOFTWARE\Docker Inc.\Docker\1.0' InstallPath -ErrorAction SilentlyContinue
+            if ($ddPath) {
+              $ddExe = Join-Path $ddPath 'Docker Desktop.exe'
+            } else {
+              $ddExe = "$env:ProgramFiles\Docker\Docker\Docker Desktop.exe"
+            }
+            if (Test-Path $ddExe) {
+              Start-Process $ddExe
+              Write-Host ">> Waiting for Docker daemon to become ready..."
+              $maxWait = 90; $waited = 0
+              while ($waited -lt $maxWait) {
+                Start-Sleep -Seconds 3; $waited += 3
+                try { docker info 2>$null | Out-Null; $dockerRunning = $true; break } catch { }
+                Write-Host "   ... still waiting ($waited s)"
+              }
+              if (-not $dockerRunning) {
+                Write-Warning "Docker daemon did not start within ${maxWait}s. Skipping prune."
+              }
+            } else {
+              Write-Warning "Docker Desktop executable not found at '$ddExe'. Skipping prune."
+            }
+          }
+
+          if ($dockerRunning) {
+            try {
+              docker system prune -a --volumes --force
+              $pruneSucceeded = $true
+              Write-Host ">> Prune completed successfully."
+            } catch {
+              Write-Warning ("docker prune failed: {0}" -f $_.Exception.Message)
+            }
+          }
         }
       } else {
         Write-Host ">> Prune skipped by user."
@@ -227,11 +265,29 @@ try {
     Write-Host ">> 'docker' command not found; skipping prune."
   }
 
-  # 1) Stop Docker & WSL
+  # 1) Run fstrim inside WSL distros to mark freed blocks before compacting
+  if ($pruneSucceeded) {
+    Write-Host ">> Running fstrim inside WSL distros to release freed blocks..."
+    $wslDistros = @()
+    try { $wslDistros = (wsl -l -q 2>$null) | Where-Object { $_ -and $_.Trim() } } catch { }
+    foreach ($distro in $wslDistros) {
+      $distroName = $distro.Trim() -replace '\x00',''
+      if (-not $distroName) { continue }
+      Write-Host "   fstrim: $distroName"
+      try { wsl -d $distroName -u root -- fstrim / 2>$null } catch { }
+      # Also try /mnt/wsl paths for Docker Desktop data
+      if ($distroName -match 'docker-desktop') {
+        try { wsl -d $distroName -u root -- fstrim /mnt/docker-desktop-disk/data 2>$null } catch { }
+      }
+    }
+    Start-Sleep -Seconds 2
+  }
+
+  # 2) Stop Docker & WSL
   Stop-DockerDesktop
   WSL-Shutdown
 
-  # 2) Targets
+  # 3) Targets
   $targets = @()
   if ($Path) {
     if (-not (Test-Path $Path)) { throw "Target not found: $Path" }
@@ -251,13 +307,13 @@ try {
     }
   }
 
-  # 3) Engine: Optimize-VHD or DiskPart
+  # 4) Engine: Optimize-VHD or DiskPart
   $useOptimize = Ensure-HyperVModule
 
-  # 4) Process
+  # 5) Process
   $results = foreach ($f in $targets) { Shrink-OneVHDX -File $f -UseOptimize:$useOptimize }
 
-  # 5) Summary
+  # 6) Summary
   $totalBefore = ($results | Measure-Object -Property Before -Sum).Sum
   $totalAfter  = ($results | Measure-Object -Property After  -Sum).Sum
   $totalSaved  = ($results | Measure-Object -Property Saved  -Sum).Sum
